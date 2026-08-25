@@ -1,9 +1,5 @@
 # Synthetic Agentic Session Replay
 
-> **Not yet available.** `data.type: synthetic_agentic` is still being finalized and is not
-> enabled in any released version. Attempting to use it will produce a validation error at startup.
-> This document describes the intended interface for when the feature ships.
-
 Generate agentic LLM workloads procedurally, without a recorded trace. `synthetic_agentic` builds
 replay-graph sessions — multi-turn conversations, tool-calling loops, and recursive sub-agent
 fan-out — from a handful of config knobs, then drives them against the target inference server
@@ -40,18 +36,18 @@ session scheduling, output substitution, session-level metrics — is identical.
 ## Quick Start
 
 ```bash
-# Run a config against a local vLLM server (+ Jaeger for tracing)
-./examples/otel/run_with_jaeger.sh <your-config>.yml
+# Run a demo config against a local vLLM server (+ Jaeger for tracing)
+./examples/otel/run_with_jaeger.sh examples/synthetic_agentic/demo/03_single_agent_tool_loop.yml
 
 # Or run directly
 python -m inference_perf.main \
-  --config <your-config>.yml
+  --config examples/synthetic_agentic/demo/03_single_agent_tool_loop.yml
 
 # Inspect a generated session graph without a server
 # (this offline tool sizes turns with a real tokenizer, so the config needs a
 #  top-level `tokenizer: {pretrained_model_name_or_path: "<model>"}` block)
 python -m inference_perf.datagen.synthetic_agentic_to_replay_graph \
-  --config <your-config>.yml \
+  --config examples/synthetic_agentic/demo/09_recursive_fanout.yml \
   --session-index 0 \
   --output /tmp/graph.json \
   --summary
@@ -147,9 +143,9 @@ data:
     output_tokens_per_turn: {type: fixed, mean: 80}
 ```
 
-Example configs covering the main shapes (bare, tool loop, parallel calls, orchestrator fan-out,
-recursive fan-out, big catalog) will be added to `examples/synthetic_agentic/` when the feature
-ships.
+More ready-to-run configs live in [`examples/synthetic_agentic/`](../examples/synthetic_agentic/)
+— the `demo/` directory has one numbered config per shape (bare, tool loop, parallel calls,
+orchestrator fan-out, recursive fan-out, big catalog, …).
 
 ## How it works
 
