@@ -301,17 +301,6 @@ def test_chat_conversion_basic_span_shape(tmp_path: Path) -> None:
     assert span["start_time"] != span["end_time"]
 
 
-def test_chat_conversion_drops_reasoning(tmp_path: Path) -> None:
-    f = write_jsonl(tmp_path / "calls.jsonl", [chat_record(reasoning="secret chain of thought")])
-    trace = convert_wire_file(f)
-
-    blob = json.dumps(trace)
-    assert "secret chain of thought" not in blob
-    assert "reasoning" not in blob
-    parts = json.loads(trace["spans"][0]["attributes"]["gen_ai.output.messages"])[0]["parts"]
-    assert [p["type"] for p in parts] == ["text"]
-
-
 def test_chat_conversion_tool_calls_arguments_parsed_to_dict(tmp_path: Path) -> None:
     tool_calls = [
         {
@@ -415,21 +404,6 @@ def test_responses_conversion_input_item_types(tmp_path: Path) -> None:
     assert messages[2]["role"] == "user"
     # the encrypted reasoning item is skipped entirely
     assert "OPAQUE" not in json.dumps(trace)
-
-
-def test_responses_conversion_drops_reasoning_output(tmp_path: Path) -> None:
-    output_items = [
-        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking hard"}], "encrypted_content": "X"},
-        {"type": "message", "content": [{"type": "output_text", "text": "final"}]},
-    ]
-    f = write_jsonl(tmp_path / "calls.jsonl", [responses_record(output_items=output_items, reasoning_tokens=42)])
-    trace = convert_wire_file(f)
-
-    blob = json.dumps(trace)
-    assert "thinking hard" not in blob
-    assert "reasoning" not in blob
-    parts = json.loads(trace["spans"][0]["attributes"]["gen_ai.output.messages"])[0]["parts"]
-    assert parts == [{"type": "text", "content": "final"}]
 
 
 def test_responses_conversion_flat_tool_definitions(tmp_path: Path) -> None:

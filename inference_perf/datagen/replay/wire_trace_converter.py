@@ -25,9 +25,12 @@ Supports four file shapes, detected from the first non-blank line rather than th
 - Responses API wire (.jsonl)    path contains "/responses"; response is an SSE stream
 - Chat Completions wire (.jsonl) path contains "/chat/completions"; response is plain JSON
 
-Reasoning content is intentionally never emitted. The replay path flattens message parts
-and only consumes text / tool_call / tool_call_response, so reasoning would be silently
-dropped downstream anyway.
+Reasoning content is emitted by default as a {"type": "reasoning", "content": ...} part
+ordered ahead of the visible text, with the token count on
+gen_ai.usage.reasoning.output_tokens, per the OTel GenAI examples. Reasoning appears only
+in output messages, never in input. Pass include_reasoning=False to omit it -- the replay
+path does, since it flattens message parts and consumes only text / tool_call /
+tool_call_response.
 """
 
 import hashlib
@@ -207,6 +210,17 @@ def _text_parts(content: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _reasoning_parts(reasoning: Any) -> List[Dict[str, Any]]:
+    """Build the OTel reasoning part for a model's chain of thought, if any.
+
+    Per the OTel GenAI examples a reasoning part is {"type": "reasoning", "content": str}
+    and appears only in output messages, ordered ahead of the visible text.
+    """
+    if isinstance(reasoning, str) and reasoning:
+        return [{"type": "reasoning", "content": reasoning}]
+    return []
+
+
 def _convert_responses_input(input_items: List[Any]) -> List[Dict[str, Any]]:
     """Convert Responses API input[] items to OTel messages in parts format.
 
@@ -258,8 +272,16 @@ def _convert_responses_input(input_items: List[Any]) -> List[Dict[str, Any]]:
     return messages
 
 
-def _convert_responses_output(output_items: List[Any], finish_reason: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Convert Responses API output[] items to a single OTel output message."""
+def _convert_responses_output(
+    output_items: List[Any], finish_reason: Optional[str], include_reasoning: bool = True
+) -> Optional[Dict[str, Any]]:
+    """Convert Responses API output[] items to a single OTel output message.
+
+    Reasoning items normally carry only encrypted_content, which is unusable; when a
+    plaintext summary is present it becomes a {type: reasoning} part. Because reasoning
+    items precede the message in output[], the resulting part lands first, as the OTel
+    GenAI examples show. Pass include_reasoning=False to omit it.
+    """
     parts: List[Dict[str, Any]] = []
 
     for item in output_items:
@@ -282,7 +304,10 @@ def _convert_responses_output(output_items: List[Any], finish_reason: Optional[s
                 }
             )
 
-        # type=reasoning: skipped
+        elif item_type == "reasoning" and include_reasoning:
+            for part in item.get("summary") or []:
+                if isinstance(part, dict) and part.get("type") == "summary_text":
+                    parts.extend(_reasoning_parts(part.get("text")))
 
     if not parts:
         return None
@@ -340,10 +365,14 @@ def _convert_chat_messages(messages: List[Any]) -> List[Dict[str, Any]]:
     return result
 
 
-def _convert_chat_output(resp: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def _convert_chat_output(
+    resp: Dict[str, Any], include_reasoning: bool = True
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Extract (output_message, finish_reason) from a Chat Completions response.
 
-    message.reasoning / message.reasoning_content are intentionally ignored.
+    Plaintext reasoning (message.reasoning, exposed by models such as Nemotron) becomes a
+    {type: reasoning} part ordered before the text and tool_call parts, per the OTel GenAI
+    examples. Pass include_reasoning=False to omit it.
     """
     choices = resp.get("choices") or []
     if not choices or not isinstance(choices[0], dict):
@@ -352,7 +381,10 @@ def _convert_chat_output(resp: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]]
     finish_reason = choice.get("finish_reason", "")
     msg = choice.get("message") or {}
 
-    parts: List[Dict[str, Any]] = _text_parts(msg.get("content"))
+    parts: List[Dict[str, Any]] = []
+    if include_reasoning:
+        parts.extend(_reasoning_parts(msg.get("reasoning") or msg.get("reasoning_content")))
+    parts.extend(_text_parts(msg.get("content")))
 
     for tc in msg.get("tool_calls") or []:
         if not isinstance(tc, dict):
@@ -416,6 +448,7 @@ def _build_span(
     input_tokens: int,
     output_tokens: int,
     cached_tokens: int,
+    reasoning_tokens: int,
     response_id: str,
     finish_reason: Optional[str],
     input_messages: List[Dict[str, Any]],
@@ -452,6 +485,9 @@ def _build_span(
     attrs = span["attributes"]
     if cached_tokens:
         attrs["gen_ai.usage.cache_read_tokens"] = cached_tokens
+    if reasoning_tokens:
+        # Per the OTel GenAI conventions this is a subset of output_tokens, not an addition.
+        attrs["gen_ai.usage.reasoning.output_tokens"] = reasoning_tokens
     if response_id:
         attrs["gen_ai.response.id"] = response_id
     if finish_reason:
@@ -475,7 +511,9 @@ def _load_request(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return request if isinstance(request, dict) else None
 
 
-def convert_responses_api_record(record: Dict[str, Any], trace_id: str) -> Optional[Dict[str, Any]]:
+def convert_responses_api_record(
+    record: Dict[str, Any], trace_id: str, include_reasoning: bool = True
+) -> Optional[Dict[str, Any]]:
     """Convert one Responses API wire record to an OTel span.
 
     The response body is an SSE stream; usage and output come from response.completed.
@@ -492,6 +530,7 @@ def convert_responses_api_record(record: Dict[str, Any], trace_id: str) -> Optio
     finish_reason = "stop" if response_status == "completed" else response_status
 
     start_time, end_time = _timestamps(record)
+    reasoning_tokens = (usage.get("output_tokens_details") or {}).get("reasoning_tokens", 0) if include_reasoning else 0
 
     return _build_span(
         trace_id=trace_id,
@@ -502,15 +541,18 @@ def convert_responses_api_record(record: Dict[str, Any], trace_id: str) -> Optio
         input_tokens=usage.get("input_tokens", 0),
         output_tokens=usage.get("output_tokens", 0),
         cached_tokens=(usage.get("input_tokens_details") or {}).get("cached_tokens", 0),
+        reasoning_tokens=reasoning_tokens,
         response_id=completed.get("id", ""),
         finish_reason=finish_reason,
         input_messages=_convert_responses_input(request.get("input") or []),
-        output_msg=_convert_responses_output(completed.get("output") or [], finish_reason),
+        output_msg=_convert_responses_output(completed.get("output") or [], finish_reason, include_reasoning),
         tool_defs=_extract_tool_defs(request.get("tools") or [], nested=False),
     )
 
 
-def convert_chat_completions_record(record: Dict[str, Any], trace_id: str) -> Optional[Dict[str, Any]]:
+def convert_chat_completions_record(
+    record: Dict[str, Any], trace_id: str, include_reasoning: bool = True
+) -> Optional[Dict[str, Any]]:
     """Convert one Chat Completions wire record to an OTel span.
 
     The response body is a plain JSON object with choices[] and usage.
@@ -523,8 +565,9 @@ def convert_chat_completions_record(record: Dict[str, Any], trace_id: str) -> Op
     resp = _parse_chat_completions_response(record.get("response"))
     usage = (resp or {}).get("usage") or {}
 
-    output_msg, finish_reason = _convert_chat_output(resp) if resp else (None, None)
+    output_msg, finish_reason = _convert_chat_output(resp, include_reasoning) if resp else (None, None)
     start_time, end_time = _timestamps(record)
+    reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) if include_reasoning else 0
 
     return _build_span(
         trace_id=trace_id,
@@ -535,6 +578,7 @@ def convert_chat_completions_record(record: Dict[str, Any], trace_id: str) -> Op
         input_tokens=usage.get("prompt_tokens", 0),
         output_tokens=usage.get("completion_tokens", 0),
         cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
+        reasoning_tokens=reasoning_tokens,
         response_id=(resp or {}).get("id", ""),
         finish_reason=finish_reason,
         input_messages=_convert_chat_messages(request.get("messages") or []),
@@ -543,13 +587,13 @@ def convert_chat_completions_record(record: Dict[str, Any], trace_id: str) -> Op
     )
 
 
-def convert_wire_record(record: Dict[str, Any], trace_id: str) -> Optional[Dict[str, Any]]:
+def convert_wire_record(record: Dict[str, Any], trace_id: str, include_reasoning: bool = True) -> Optional[Dict[str, Any]]:
     """Convert one wire record to an OTel span, dispatching on its API path."""
     api_path = record.get("path", "")
     if "/chat/completions" in api_path:
-        return convert_chat_completions_record(record, trace_id)
+        return convert_chat_completions_record(record, trace_id, include_reasoning)
     if "/responses" in api_path:
-        return convert_responses_api_record(record, trace_id)
+        return convert_responses_api_record(record, trace_id, include_reasoning)
     return None
 
 
@@ -583,7 +627,7 @@ def derive_trace_id(path: Path) -> str:
     return hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:32]
 
 
-def iter_wire_spans(path: Path, trace_id: str) -> Iterator[Dict[str, Any]]:
+def iter_wire_spans(path: Path, trace_id: str, include_reasoning: bool = True) -> Iterator[Dict[str, Any]]:
     """Stream a wire capture file, yielding one OTel span per convertible record.
 
     Reads line by line and drops each parsed record after converting it, so the file's
@@ -599,19 +643,19 @@ def iter_wire_spans(path: Path, trace_id: str) -> Iterator[Dict[str, Any]]:
                 raise ValueError(f"{path}:{line_no}: invalid JSON: {e}") from e
             if not isinstance(record, dict):
                 continue
-            span = convert_wire_record(record, trace_id)
+            span = convert_wire_record(record, trace_id, include_reasoning)
             if span is not None:
                 yield span
 
 
-def convert_wire_file(path: Path, trace_id: Optional[str] = None) -> Dict[str, Any]:
+def convert_wire_file(path: Path, trace_id: Optional[str] = None, include_reasoning: bool = True) -> Dict[str, Any]:
     """Convert a wire capture file to a complete OTel trace document.
 
     One file is one session, so the result mirrors the local OTel document shape the
     replay loader already understands.
     """
     resolved_trace_id = trace_id or derive_trace_id(path)
-    spans = list(iter_wire_spans(path, resolved_trace_id))
+    spans = list(iter_wire_spans(path, resolved_trace_id, include_reasoning))
     return {
         "trace_id": resolved_trace_id,
         "span_count": len(spans),

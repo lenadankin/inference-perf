@@ -294,7 +294,10 @@ def _rows_for_file(trace_file: Path, skip_invalid: bool) -> List[Dict[str, Any]]
 
     if trace_format in WIRE_FORMATS:
         # Converted in memory; records are streamed and dropped as spans are built.
-        converted = convert_wire_file(trace_file)
+        # Reasoning is omitted here: the replay path flattens message parts and consumes
+        # only text / tool_call / tool_call_response, so a reasoning part would be dropped
+        # downstream anyway (see _replay_message_to_dict in otel_trace_to_replay_graph).
+        converted = convert_wire_file(trace_file, include_reasoning=False)
         if not converted["spans"]:
             raise ValueError(f"{trace_file}: wire capture produced no convertible spans")
         return [_normalize_file_trace(converted, trace_file.name, str(trace_file))]
